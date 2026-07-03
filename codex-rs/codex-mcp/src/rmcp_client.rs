@@ -68,7 +68,6 @@ use rmcp::model::InitializeRequestParams;
 use rmcp::model::JsonObject;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::Tool as RmcpTool;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -113,7 +112,7 @@ pub(crate) struct ManagedClient {
 
 #[derive(Clone)]
 pub(crate) struct ManagedToolList {
-    state: Arc<TokioMutex<ManagedToolListState>>,
+    state: Arc<StdMutex<ManagedToolListState>>,
 }
 
 struct ManagedToolListState {
@@ -124,24 +123,49 @@ struct ManagedToolListState {
 impl ManagedToolList {
     pub(crate) fn new(change_generation: u64, tools: Vec<ToolInfo>) -> Self {
         Self {
-            state: Arc::new(TokioMutex::new(ManagedToolListState {
+            state: Arc::new(StdMutex::new(ManagedToolListState {
                 change_generation,
                 tools,
             })),
         }
     }
 
-    async fn current_tools(&self) -> Vec<ToolInfo> {
-        self.state.lock().await.tools.clone()
+    /// Claims `target_generation` when it is newer than the stored generation.
+    /// Returns whether the caller won the claim and should refresh the tools;
+    /// concurrent callers lose the claim and keep serving the current list, so
+    /// at most one refresh runs per notification.
+    fn claim_generation(&self, target_generation: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.change_generation >= target_generation {
+            return false;
+        }
+        state.change_generation = target_generation;
+        true
+    }
+
+    fn set_tools(&self, tools: Vec<ToolInfo>) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools = tools;
+    }
+
+    fn current_tools(&self) -> Vec<ToolInfo> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
+            .clone()
     }
 }
 
 impl ManagedClient {
     async fn listed_tools(&self) -> Vec<ToolInfo> {
         let total_start = Instant::now();
-        let tool_list_change_generation = self.client.tool_list_change_generation();
-        self.refresh_tools_if_changed(tool_list_change_generation)
-            .await;
+        self.refresh_tools_if_changed().await;
         if let Some(tools) = self
             .codex_apps_tools_cache_context
             .as_ref()
@@ -163,59 +187,76 @@ impl ManagedClient {
             );
         }
 
-        self.tools.current_tools().await
+        self.tools.current_tools()
     }
 
-    async fn refresh_tools_if_changed(&self, tool_list_change_generation: u64) {
-        {
-            let state = self.tools.state.lock().await;
-            if state.change_generation == tool_list_change_generation {
-                return;
-            }
+    async fn refresh_tools_if_changed(&self) {
+        // Claiming the generation before fetching keeps duplicate fetches out
+        // (concurrent callers lose the claim and serve the current list) and
+        // caps a misbehaving server at one refresh attempt per notification
+        // instead of a blocking fetch on every model turn: the generation stays
+        // claimed even when the fetch below fails, and the next notification
+        // triggers a new attempt.
+        let target_generation = self.client.tool_list_change_generation();
+        if !self.tools.claim_generation(target_generation) {
+            return;
         }
 
-        let fetch_start = Instant::now();
-        let fetch_ticket = self
-            .codex_apps_tools_cache_context
-            .as_ref()
-            .map(|cache_context| {
-                cache_context.begin_fetch(CodexAppsToolsFetchSource::ToolListChanged)
-            });
-        let tools = list_tools_for_client_uncached(
-            &self.server_name,
-            self.is_codex_apps_mcp_server,
-            &self.client,
-            self.tool_timeout,
-            self.server_instructions.as_deref(),
-        )
-        .await;
-        emit_duration(
-            MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
-            fetch_start.elapsed(),
-            &[],
-        );
-        let tools = match tools {
-            Ok(tools) => tools,
+        match self
+            .fetch_and_publish_tools(
+                CodexAppsToolsFetchSource::ToolListChanged,
+                self.tool_timeout,
+            )
+            .await
+        {
+            Ok(tools) => {
+                // For Codex Apps servers listed_tools serves from the shared cache
+                // (published inside fetch_and_publish_tools); the local copy is kept
+                // as a fallback for when the cache has no entry.
+                self.tools.set_tools(filter_tools(tools, &self.tool_filter));
+            }
             Err(error) => {
                 warn!(
                     server_name = %self.server_name,
                     "failed to refresh MCP tools after tool list changed notification: {error:#}"
                 );
-                return;
             }
-        };
-        let tools = match (self.codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
-            (Some(cache_context), Some(fetch_ticket)) => {
+        }
+    }
+
+    /// Fetches the server's tools, bypassing any cache, and publishes the result
+    /// to the shared Codex Apps tools cache when one is configured. Returns the
+    /// newest accepted tools. The uncached-fetch duration metric is only emitted
+    /// on success, matching the other fetch sites.
+    pub(crate) async fn fetch_and_publish_tools(
+        &self,
+        source: CodexAppsToolsFetchSource,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<ToolInfo>> {
+        let fetch_start = Instant::now();
+        let cache_fetch = self
+            .codex_apps_tools_cache_context
+            .as_ref()
+            .map(|cache_context| (cache_context, cache_context.begin_fetch(source)));
+        let tools = list_tools_for_client_uncached(
+            &self.server_name,
+            self.is_codex_apps_mcp_server,
+            &self.client,
+            timeout,
+            self.server_instructions.as_deref(),
+        )
+        .await?;
+        emit_duration(
+            MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
+            fetch_start.elapsed(),
+            &[],
+        );
+        Ok(match cache_fetch {
+            Some((cache_context, fetch_ticket)) => {
                 cache_context.publish_if_newest_accepted(fetch_ticket, &self.server_info, tools)
             }
-            (None, None) => tools,
-            _ => unreachable!("Codex Apps fetch ticket requires cache context"),
-        };
-        let mut state = self.tools.state.lock().await;
-        if state.change_generation < tool_list_change_generation {
-            state.tools = filter_tools(tools, &self.tool_filter);
-            state.change_generation = tool_list_change_generation;
-        }
+            None => tools,
+        })
     }
 }
 
@@ -903,32 +944,27 @@ async fn start_server_task(
         .and_then(|exp| exp.get(MCP_SANDBOX_STATE_META_CAPABILITY))
         .is_some();
     let list_start = Instant::now();
-    let fetch_start = Instant::now();
-    let fetch_ticket = codex_apps_tools_cache_context
-        .as_ref()
-        .map(|cache_context| cache_context.begin_fetch(CodexAppsToolsFetchSource::Startup));
-    let tools = list_tools_for_client_uncached(
-        &server_name,
-        is_codex_apps_mcp_server,
-        &client,
-        startup_timeout,
-        initialize_result.instructions.as_deref(),
-    )
-    .await
-    .map_err(StartupOutcomeError::from)?;
-    emit_duration(
-        MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
-        fetch_start.elapsed(),
-        &[],
-    );
     let server_info = mcp_server_info_from_implementation(initialize_result.server_info);
-    let tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
-        (Some(cache_context), Some(fetch_ticket)) => {
-            cache_context.publish_if_newest_accepted(fetch_ticket, &server_info, tools)
-        }
-        (None, None) => tools,
-        _ => unreachable!("Codex Apps fetch ticket requires cache context"),
+    // Snapshot the generation before fetching so a tools/list_changed
+    // notification that races the startup fetch leaves the stored generation
+    // behind and triggers a refresh on the next listed_tools call.
+    let tool_list_change_generation = client.tool_list_change_generation();
+    let managed = ManagedClient {
+        client: Arc::clone(&client),
+        server_name,
+        is_codex_apps_mcp_server,
+        server_info,
+        tools: ManagedToolList::new(tool_list_change_generation, Vec::new()),
+        tool_timeout: Some(tool_timeout),
+        tool_filter,
+        server_instructions: initialize_result.instructions,
+        server_supports_sandbox_state_meta_capability,
+        codex_apps_tools_cache_context,
     };
+    let tools = managed
+        .fetch_and_publish_tools(CodexAppsToolsFetchSource::Startup, startup_timeout)
+        .await
+        .map_err(StartupOutcomeError::from)?;
     if is_codex_apps_mcp_server {
         emit_duration(
             MCP_TOOLS_LIST_DURATION_METRIC,
@@ -936,20 +972,9 @@ async fn start_server_task(
             &[("cache", "miss")],
         );
     }
-    let tools = filter_tools(tools, &tool_filter);
-
-    let managed = ManagedClient {
-        client: Arc::clone(&client),
-        server_name,
-        is_codex_apps_mcp_server,
-        server_info,
-        tools: ManagedToolList::new(client.tool_list_change_generation(), tools),
-        tool_timeout: Some(tool_timeout),
-        tool_filter,
-        server_instructions: initialize_result.instructions,
-        server_supports_sandbox_state_meta_capability,
-        codex_apps_tools_cache_context,
-    };
+    managed
+        .tools
+        .set_tools(filter_tools(tools, &managed.tool_filter));
 
     Ok(managed)
 }

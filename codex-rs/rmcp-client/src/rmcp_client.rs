@@ -138,6 +138,9 @@ struct InitializeContext {
     client_service: ElicitationClientService,
 }
 
+/// Shared counters for server-initiated notifications, bumped by the client's
+/// notification handler and observed by callers via snapshot getters on
+/// [`RmcpClient`].
 #[derive(Clone)]
 pub(crate) struct McpServerNotificationState {
     tool_list_change_generation: Arc<AtomicU64>,
@@ -530,6 +533,11 @@ impl RmcpClient {
         Ok(result)
     }
 
+    /// Returns a monotonically increasing counter that is bumped each time the
+    /// server sends a `notifications/tools/list_changed` notification. Callers
+    /// snapshot this value alongside a fetched tool list and refetch when a
+    /// later snapshot differs, so snapshot the generation *before* listing
+    /// tools to avoid missing a notification that races the fetch.
     pub fn tool_list_change_generation(&self) -> u64 {
         self.notification_state.tool_list_change_generation()
     }

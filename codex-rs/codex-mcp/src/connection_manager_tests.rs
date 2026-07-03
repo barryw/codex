@@ -130,6 +130,8 @@ impl InProcessTransportFactory for TestInProcessTransportFactory {
 #[derive(Clone, Default)]
 struct DynamicToolListServer {
     extra_tool_enabled: Arc<AtomicBool>,
+    fail_list_tools: Arc<AtomicBool>,
+    list_tools_calls: Arc<AtomicUsize>,
 }
 
 impl DynamicToolListServer {
@@ -175,6 +177,13 @@ impl ServerHandler for DynamicToolListServer {
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        self.list_tools_calls.fetch_add(1, Ordering::AcqRel);
+        if self.fail_list_tools.load(Ordering::Acquire) {
+            return Err(rmcp::ErrorData::internal_error(
+                "list_tools failure requested by test",
+                None,
+            ));
+        }
         let extra_tool_enabled = self.extra_tool_enabled.load(Ordering::Acquire);
         let schema_property = if extra_tool_enabled {
             "lookback"
@@ -944,15 +953,11 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
     assert_eq!(tool.callable_name, "calendar_create_event");
 }
 
-#[tokio::test]
-async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
-    let server_name = "dynamic";
+async fn initialize_dynamic_rmcp_client(server: DynamicToolListServer) -> Arc<RmcpClient> {
     let rmcp_client = Arc::new(
-        RmcpClient::new_in_process_client(Arc::new(DynamicToolListTransportFactory {
-            server: DynamicToolListServer::default(),
-        }))
-        .await
-        .expect("create in-process RMCP client"),
+        RmcpClient::new_in_process_client(Arc::new(DynamicToolListTransportFactory { server }))
+            .await
+            .expect("create in-process RMCP client"),
     );
     let send_elicitation: SendElicitation =
         Box::new(|_, _| async { Err(anyhow::anyhow!("unexpected elicitation request")) }.boxed());
@@ -968,32 +973,50 @@ async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
         )
         .await
         .expect("initialize RMCP client");
+    rmcp_client
+}
+
+async fn create_dynamic_managed_client(
+    server_name: &str,
+    rmcp_client: &Arc<RmcpClient>,
+    is_codex_apps_mcp_server: bool,
+    codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
+) -> ManagedClient {
+    let tool_list_change_generation = rmcp_client.tool_list_change_generation();
     let startup_tools = list_tools_for_client_uncached(
         server_name,
-        /*is_codex_apps_mcp_server*/ false,
-        &rmcp_client,
+        is_codex_apps_mcp_server,
+        rmcp_client,
         Some(Duration::from_secs(1)),
         /*server_instructions*/ None,
     )
     .await
     .expect("list startup tools");
     let tool_filter = ToolFilter::default();
-    let managed_client = ManagedClient {
-        client: Arc::clone(&rmcp_client),
+    ManagedClient {
+        client: Arc::clone(rmcp_client),
         server_name: server_name.to_string(),
-        is_codex_apps_mcp_server: false,
+        is_codex_apps_mcp_server,
         server_info: create_test_server_info("Dynamic"),
         tools: ManagedToolList::new(
-            rmcp_client.tool_list_change_generation(),
+            tool_list_change_generation,
             filter_tools(startup_tools, &tool_filter),
         ),
-        tool_filter: tool_filter.clone(),
+        tool_filter,
         tool_timeout: Some(Duration::from_secs(1)),
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: false,
-        codex_apps_tools_cache_context: None,
-    };
+        codex_apps_tools_cache_context,
+    }
+}
 
+fn manager_with_ready_client(
+    server_name: &str,
+    managed_client: ManagedClient,
+) -> McpConnectionManager {
+    let is_codex_apps_mcp_server = managed_client.is_codex_apps_mcp_server;
+    let codex_apps_tools_cache_context = managed_client.codex_apps_tools_cache_context.clone();
+    let tool_filter = managed_client.tool_filter.clone();
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
     let mut manager = McpConnectionManager::new_uninitialized(
@@ -1009,9 +1032,9 @@ async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
             ))
             .boxed()
             .shared(),
-            is_codex_apps_mcp_server: false,
+            is_codex_apps_mcp_server,
             cached_server_info: None,
-            codex_apps_tools_cache_context: None,
+            codex_apps_tools_cache_context,
             tool_filter,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             startup_reconnect: None,
@@ -1019,6 +1042,44 @@ async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
             cancel_token: CancellationToken::new(),
         },
     );
+    manager
+}
+
+/// Calls the server's `enable_extra` tool, which mutates its tool list and
+/// sends `notifications/tools/list_changed`, then waits until the client has
+/// observed the notification.
+async fn trigger_tool_list_changed(rmcp_client: &Arc<RmcpClient>) {
+    let generation_before_call = rmcp_client.tool_list_change_generation();
+    rmcp_client
+        .call_tool(
+            "enable_extra".to_string(),
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect("enable extra tool");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while rmcp_client.tool_list_change_generation() == generation_before_call {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("tool list changed notification");
+}
+
+#[tokio::test]
+async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
+    let server_name = "dynamic";
+    let rmcp_client = initialize_dynamic_rmcp_client(DynamicToolListServer::default()).await;
+    let managed_client = create_dynamic_managed_client(
+        server_name,
+        &rmcp_client,
+        /*is_codex_apps_mcp_server*/ false,
+        /*codex_apps_tools_cache_context*/ None,
+    )
+    .await;
+    let manager = manager_with_ready_client(server_name, managed_client);
 
     let startup_tools = manager.list_all_tools().await;
     let startup_model_tool_names = model_tool_names(&startup_tools);
@@ -1040,23 +1101,7 @@ async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
         "lookback"
     ));
 
-    let generation_before_call = rmcp_client.tool_list_change_generation();
-    rmcp_client
-        .call_tool(
-            "enable_extra".to_string(),
-            /*arguments*/ None,
-            /*meta*/ None,
-            Some(Duration::from_secs(1)),
-        )
-        .await
-        .expect("enable extra tool");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while rmcp_client.tool_list_change_generation() == generation_before_call {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("tool list changed notification");
+    trigger_tool_list_changed(&rmcp_client).await;
 
     let refreshed_tools = manager.list_all_tools().await;
     let refreshed_model_tool_names = model_tool_names(&refreshed_tools);
@@ -1076,6 +1121,82 @@ async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
         &schema_tool_name,
         "duration"
     ));
+}
+
+#[tokio::test]
+async fn list_all_tools_keeps_previous_tools_when_refresh_fails() {
+    let server_name = "dynamic";
+    let server = DynamicToolListServer::default();
+    let rmcp_client = initialize_dynamic_rmcp_client(server.clone()).await;
+    let managed_client = create_dynamic_managed_client(
+        server_name,
+        &rmcp_client,
+        /*is_codex_apps_mcp_server*/ false,
+        /*codex_apps_tools_cache_context*/ None,
+    )
+    .await;
+    let manager = manager_with_ready_client(server_name, managed_client);
+
+    let startup_list_tools_calls = server.list_tools_calls.load(Ordering::Acquire);
+    server.fail_list_tools.store(true, Ordering::Release);
+    trigger_tool_list_changed(&rmcp_client).await;
+
+    let stale_tools = manager.list_all_tools().await;
+    let stale_model_tool_names = model_tool_names(&stale_tools);
+    assert!(stale_model_tool_names.contains(&ToolName::namespaced("mcp__dynamic", "enable_extra")));
+    assert!(!stale_model_tool_names.contains(&ToolName::namespaced("mcp__dynamic", "extra_tool")));
+    let calls_after_failed_refresh = server.list_tools_calls.load(Ordering::Acquire);
+    assert_eq!(calls_after_failed_refresh, startup_list_tools_calls + 1);
+
+    // A failed refresh is not retried until the server sends another notification.
+    manager.list_all_tools().await;
+    assert_eq!(
+        server.list_tools_calls.load(Ordering::Acquire),
+        calls_after_failed_refresh
+    );
+
+    server.fail_list_tools.store(false, Ordering::Release);
+    trigger_tool_list_changed(&rmcp_client).await;
+    let refreshed_tools = manager.list_all_tools().await;
+    let refreshed_model_tool_names = model_tool_names(&refreshed_tools);
+    assert!(
+        refreshed_model_tool_names.contains(&ToolName::namespaced("mcp__dynamic", "extra_tool"))
+    );
+}
+
+#[tokio::test]
+async fn tool_list_changed_refresh_publishes_to_codex_apps_cache() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache_context = create_codex_apps_tools_cache_context(
+        codex_home.path().to_path_buf(),
+        Some("account-one"),
+        Some("user-one"),
+    );
+    let rmcp_client = initialize_dynamic_rmcp_client(DynamicToolListServer::default()).await;
+    let managed_client = create_dynamic_managed_client(
+        CODEX_APPS_MCP_SERVER_NAME,
+        &rmcp_client,
+        /*is_codex_apps_mcp_server*/ true,
+        Some(cache_context.clone()),
+    )
+    .await;
+    let manager = manager_with_ready_client(CODEX_APPS_MCP_SERVER_NAME, managed_client);
+    assert!(!cache_context.has_current_tools());
+
+    trigger_tool_list_changed(&rmcp_client).await;
+    let refreshed_tools = manager.list_all_tools().await;
+    let refreshed_model_tool_names = model_tool_names(&refreshed_tools);
+    assert!(
+        refreshed_model_tool_names.contains(&ToolName::namespaced("mcp__codex_apps", "extra_tool"))
+    );
+    let cached_tools = cache_context
+        .current_tools()
+        .expect("refresh publishes tools to shared codex apps cache");
+    assert!(
+        cached_tools
+            .iter()
+            .any(|tool| tool.tool.name == "extra_tool")
+    );
 }
 
 #[tokio::test]
