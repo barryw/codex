@@ -10,7 +10,9 @@ use crate::rmcp_client::CODEX_APPS_RECONNECT_INITIAL_BACKOFF;
 use crate::rmcp_client::CodexAppsStartupReconnect;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::ManagedClientFuture;
+use crate::rmcp_client::ManagedToolList;
 use crate::rmcp_client::StartupOutcomeError;
+use crate::rmcp_client::list_tools_for_client_uncached;
 use crate::server::EffectiveMcpServer;
 use crate::server::McpServerMetadata;
 use crate::server::McpServerOrigin;
@@ -32,20 +34,39 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_rmcp_client::InProcessTransportFactory;
 use codex_rmcp_client::RmcpClient;
+use codex_rmcp_client::SendElicitation;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
+use rmcp::ServiceExt;
+use rmcp::handler::server::ServerHandler;
+use rmcp::model::CallToolRequestParams;
+use rmcp::model::CallToolResult;
+use rmcp::model::ClientCapabilities;
+use rmcp::model::Content;
 use rmcp::model::CreateElicitationRequestParams;
+use rmcp::model::CustomNotification;
 use rmcp::model::ElicitationAction;
 use rmcp::model::ElicitationCapability;
+use rmcp::model::Extensions;
+use rmcp::model::Implementation;
+use rmcp::model::InitializeRequestParams;
 use rmcp::model::JsonObject;
+use rmcp::model::ListToolsResult;
 use rmcp::model::Meta;
 use rmcp::model::NumberOrString;
+use rmcp::model::PaginatedRequestParams;
+use rmcp::model::ProtocolVersion;
+use rmcp::model::ServerCapabilities;
+use rmcp::model::ServerInfo;
+use rmcp::model::ServerNotification;
 use rmcp::model::Tool;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tempfile::tempdir;
 use tokio::io::DuplexStream;
 
@@ -106,15 +127,134 @@ impl InProcessTransportFactory for TestInProcessTransportFactory {
     }
 }
 
+#[derive(Clone, Default)]
+struct DynamicToolListServer {
+    extra_tool_enabled: Arc<AtomicBool>,
+}
+
+impl DynamicToolListServer {
+    fn tool(tool_name: &str) -> Tool {
+        Tool::new(
+            tool_name.to_string(),
+            format!("Dynamic test tool: {tool_name}"),
+            Arc::new(JsonObject::default()),
+        )
+    }
+
+    fn tool_with_input_property(tool_name: &str, property_name: &str) -> Tool {
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                property_name: {
+                    "type": "string",
+                },
+            },
+            "required": [property_name],
+            "additionalProperties": false,
+        });
+        Tool::new(
+            tool_name.to_string(),
+            format!("Dynamic test tool: {tool_name}"),
+            Arc::new(serde_json::from_value(input_schema).expect("test schema should be valid")),
+        )
+    }
+}
+
+impl ServerHandler for DynamicToolListServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let extra_tool_enabled = self.extra_tool_enabled.load(Ordering::Acquire);
+        let schema_property = if extra_tool_enabled {
+            "lookback"
+        } else {
+            "duration"
+        };
+        let mut tools = vec![
+            Self::tool("enable_extra"),
+            Self::tool_with_input_property("schema_sensitive", schema_property),
+        ];
+        if extra_tool_enabled {
+            tools.push(Self::tool("extra_tool"));
+        }
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if request.name.as_ref() != "enable_extra" {
+            return Err(rmcp::ErrorData::internal_error("unexpected tool", None));
+        }
+
+        self.extra_tool_enabled.store(true, Ordering::Release);
+        context
+            .peer
+            .send_notification(ServerNotification::CustomNotification(CustomNotification {
+                method: "notifications/tools/list_changed".to_string(),
+                params: None,
+                extensions: Extensions::new(),
+            }))
+            .await
+            .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text("enabled")]))
+    }
+}
+
+#[derive(Clone)]
+struct DynamicToolListTransportFactory {
+    server: DynamicToolListServer,
+}
+
+impl InProcessTransportFactory for DynamicToolListTransportFactory {
+    fn open(&self) -> BoxFuture<'static, io::Result<DuplexStream>> {
+        let server = self.server.clone();
+        async move {
+            let (client_stream, server_stream) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                if let Ok(running_service) = server.serve(server_stream).await {
+                    let _ = running_service.waiting().await;
+                }
+            });
+            Ok(client_stream)
+        }
+        .boxed()
+    }
+}
+
 async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
+    let server_name = tools
+        .first()
+        .map(|tool| tool.server_name.clone())
+        .unwrap_or_else(|| "test".to_string());
     ManagedClient {
         client: Arc::new(
             RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
                 .await
                 .expect("create in-process RMCP client"),
         ),
+        server_name,
+        is_codex_apps_mcp_server: false,
         server_info: create_test_server_info("Ready"),
-        tools,
+        tools: ManagedToolList::new(0, tools),
         tool_filter: ToolFilter::default(),
         tool_timeout: None,
         server_instructions: None,
@@ -187,6 +327,23 @@ fn model_tool_names(tools: &[ToolInfo]) -> HashSet<ToolName> {
         .iter()
         .map(ToolInfo::canonical_tool_name)
         .collect::<HashSet<_>>()
+}
+
+fn model_tool_has_input_property(
+    tools: &[ToolInfo],
+    tool_name: &ToolName,
+    property_name: &str,
+) -> bool {
+    tools
+        .iter()
+        .find(|tool| {
+            let canonical_tool_name = tool.canonical_tool_name();
+            canonical_tool_name.name == tool_name.name
+                && canonical_tool_name.namespace.as_deref() == tool_name.namespace.as_deref()
+        })
+        .and_then(|tool| tool.tool.input_schema.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|properties| properties.contains_key(property_name))
 }
 
 fn model_tool_name_len(name: &ToolName) -> usize {
@@ -785,6 +942,140 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
         .expect("tool from shared cache");
     assert_eq!(tool.server_name, CODEX_APPS_MCP_SERVER_NAME);
     assert_eq!(tool.callable_name, "calendar_create_event");
+}
+
+#[tokio::test]
+async fn list_all_tools_refreshes_after_tool_list_changed_notification() {
+    let server_name = "dynamic";
+    let rmcp_client = Arc::new(
+        RmcpClient::new_in_process_client(Arc::new(DynamicToolListTransportFactory {
+            server: DynamicToolListServer::default(),
+        }))
+        .await
+        .expect("create in-process RMCP client"),
+    );
+    let send_elicitation: SendElicitation =
+        Box::new(|_, _| async { Err(anyhow::anyhow!("unexpected elicitation request")) }.boxed());
+    rmcp_client
+        .initialize(
+            InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new("codex-mcp-test-client", env!("CARGO_PKG_VERSION")),
+            )
+            .with_protocol_version(ProtocolVersion::V_2025_06_18),
+            Some(Duration::from_secs(1)),
+            send_elicitation,
+        )
+        .await
+        .expect("initialize RMCP client");
+    let startup_tools = list_tools_for_client_uncached(
+        server_name,
+        /*is_codex_apps_mcp_server*/ false,
+        &rmcp_client,
+        Some(Duration::from_secs(1)),
+        /*server_instructions*/ None,
+    )
+    .await
+    .expect("list startup tools");
+    let tool_filter = ToolFilter::default();
+    let managed_client = ManagedClient {
+        client: Arc::clone(&rmcp_client),
+        server_name: server_name.to_string(),
+        is_codex_apps_mcp_server: false,
+        server_info: create_test_server_info("Dynamic"),
+        tools: ManagedToolList::new(
+            rmcp_client.tool_list_change_generation(),
+            filter_tools(startup_tools, &tool_filter),
+        ),
+        tool_filter: tool_filter.clone(),
+        tool_timeout: Some(Duration::from_secs(1)),
+        server_instructions: None,
+        server_supports_sandbox_state_meta_capability: false,
+        codex_apps_tools_cache_context: None,
+    };
+
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionManager::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    manager.clients.insert(
+        server_name.to_string(),
+        AsyncManagedClient {
+            client: futures::future::ready::<Result<ManagedClient, StartupOutcomeError>>(Ok(
+                managed_client,
+            ))
+            .boxed()
+            .shared(),
+            is_codex_apps_mcp_server: false,
+            cached_server_info: None,
+            codex_apps_tools_cache_context: None,
+            tool_filter,
+            startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            startup_reconnect: None,
+            tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+            cancel_token: CancellationToken::new(),
+        },
+    );
+
+    let startup_tools = manager.list_all_tools().await;
+    let startup_model_tool_names = model_tool_names(&startup_tools);
+    assert!(
+        startup_model_tool_names.contains(&ToolName::namespaced("mcp__dynamic", "enable_extra"))
+    );
+    assert!(
+        !startup_model_tool_names.contains(&ToolName::namespaced("mcp__dynamic", "extra_tool"))
+    );
+    let schema_tool_name = ToolName::namespaced("mcp__dynamic", "schema_sensitive");
+    assert!(model_tool_has_input_property(
+        &startup_tools,
+        &schema_tool_name,
+        "duration"
+    ));
+    assert!(!model_tool_has_input_property(
+        &startup_tools,
+        &schema_tool_name,
+        "lookback"
+    ));
+
+    let generation_before_call = rmcp_client.tool_list_change_generation();
+    rmcp_client
+        .call_tool(
+            "enable_extra".to_string(),
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect("enable extra tool");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while rmcp_client.tool_list_change_generation() == generation_before_call {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("tool list changed notification");
+
+    let refreshed_tools = manager.list_all_tools().await;
+    let refreshed_model_tool_names = model_tool_names(&refreshed_tools);
+    assert!(
+        refreshed_model_tool_names.contains(&ToolName::namespaced("mcp__dynamic", "enable_extra"))
+    );
+    assert!(
+        refreshed_model_tool_names.contains(&ToolName::namespaced("mcp__dynamic", "extra_tool"))
+    );
+    assert!(model_tool_has_input_property(
+        &refreshed_tools,
+        &schema_tool_name,
+        "lookback"
+    ));
+    assert!(!model_tool_has_input_property(
+        &refreshed_tools,
+        &schema_tool_name,
+        "duration"
+    ));
 }
 
 #[tokio::test]

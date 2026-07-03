@@ -68,6 +68,7 @@ use rmcp::model::InitializeRequestParams;
 use rmcp::model::JsonObject;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::Tool as RmcpTool;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -99,8 +100,10 @@ const UNTRUSTED_CONNECTOR_META_KEYS: &[&str] = &[
 #[derive(Clone)]
 pub(crate) struct ManagedClient {
     pub(crate) client: Arc<RmcpClient>,
+    pub(crate) server_name: String,
+    pub(crate) is_codex_apps_mcp_server: bool,
     pub(crate) server_info: McpServerInfo,
-    pub(crate) tools: Vec<ToolInfo>,
+    pub(crate) tools: ManagedToolList,
     pub(crate) tool_filter: ToolFilter,
     pub(crate) tool_timeout: Option<Duration>,
     pub(crate) server_instructions: Option<String>,
@@ -108,9 +111,37 @@ pub(crate) struct ManagedClient {
     pub(crate) codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ManagedToolList {
+    state: Arc<TokioMutex<ManagedToolListState>>,
+}
+
+struct ManagedToolListState {
+    change_generation: u64,
+    tools: Vec<ToolInfo>,
+}
+
+impl ManagedToolList {
+    pub(crate) fn new(change_generation: u64, tools: Vec<ToolInfo>) -> Self {
+        Self {
+            state: Arc::new(TokioMutex::new(ManagedToolListState {
+                change_generation,
+                tools,
+            })),
+        }
+    }
+
+    async fn current_tools(&self) -> Vec<ToolInfo> {
+        self.state.lock().await.tools.clone()
+    }
+}
+
 impl ManagedClient {
-    fn listed_tools(&self) -> Vec<ToolInfo> {
+    async fn listed_tools(&self) -> Vec<ToolInfo> {
         let total_start = Instant::now();
+        let tool_list_change_generation = self.client.tool_list_change_generation();
+        self.refresh_tools_if_changed(tool_list_change_generation)
+            .await;
         if let Some(tools) = self
             .codex_apps_tools_cache_context
             .as_ref()
@@ -132,7 +163,59 @@ impl ManagedClient {
             );
         }
 
-        self.tools.clone()
+        self.tools.current_tools().await
+    }
+
+    async fn refresh_tools_if_changed(&self, tool_list_change_generation: u64) {
+        {
+            let state = self.tools.state.lock().await;
+            if state.change_generation == tool_list_change_generation {
+                return;
+            }
+        }
+
+        let fetch_start = Instant::now();
+        let fetch_ticket = self
+            .codex_apps_tools_cache_context
+            .as_ref()
+            .map(|cache_context| {
+                cache_context.begin_fetch(CodexAppsToolsFetchSource::ToolListChanged)
+            });
+        let tools = list_tools_for_client_uncached(
+            &self.server_name,
+            self.is_codex_apps_mcp_server,
+            &self.client,
+            self.tool_timeout,
+            self.server_instructions.as_deref(),
+        )
+        .await;
+        emit_duration(
+            MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
+            fetch_start.elapsed(),
+            &[],
+        );
+        let tools = match tools {
+            Ok(tools) => tools,
+            Err(error) => {
+                warn!(
+                    server_name = %self.server_name,
+                    "failed to refresh MCP tools after tool list changed notification: {error:#}"
+                );
+                return;
+            }
+        };
+        let tools = match (self.codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
+            (Some(cache_context), Some(fetch_ticket)) => {
+                cache_context.publish_if_newest_accepted(fetch_ticket, &self.server_info, tools)
+            }
+            (None, None) => tools,
+            _ => unreachable!("Codex Apps fetch ticket requires cache context"),
+        };
+        let mut state = self.tools.state.lock().await;
+        if state.change_generation < tool_list_change_generation {
+            state.tools = filter_tools(tools, &self.tool_filter);
+            state.change_generation = tool_list_change_generation;
+        }
     }
 }
 
@@ -513,7 +596,7 @@ impl AsyncManagedClient {
             Some(startup_tools)
         } else {
             match self.client().await {
-                Ok(client) => Some(client.listed_tools()),
+                Ok(client) => Some(client.listed_tools().await),
                 Err(_) => self.cached_tools(),
             }
         }?;
@@ -857,8 +940,10 @@ async fn start_server_task(
 
     let managed = ManagedClient {
         client: Arc::clone(&client),
+        server_name,
+        is_codex_apps_mcp_server,
         server_info,
-        tools,
+        tools: ManagedToolList::new(client.tool_list_change_generation(), tools),
         tool_timeout: Some(tool_timeout),
         tool_filter,
         server_instructions: initialize_result.instructions,

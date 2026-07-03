@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -135,6 +136,28 @@ enum TransportRecipe {
 struct InitializeContext {
     timeout: Option<Duration>,
     client_service: ElicitationClientService,
+}
+
+#[derive(Clone)]
+pub(crate) struct McpServerNotificationState {
+    tool_list_change_generation: Arc<AtomicU64>,
+}
+
+impl McpServerNotificationState {
+    fn new() -> Self {
+        Self {
+            tool_list_change_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn record_tool_list_changed(&self) {
+        self.tool_list_change_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn tool_list_change_generation(&self) -> u64 {
+        self.tool_list_change_generation.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone)]
@@ -325,6 +348,7 @@ pub struct RmcpClient {
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
     elicitation_pause_state: ElicitationPauseState,
+    notification_state: McpServerNotificationState,
 }
 
 impl RmcpClient {
@@ -345,6 +369,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            notification_state: McpServerNotificationState::new(),
         })
     }
 
@@ -379,6 +404,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            notification_state: McpServerNotificationState::new(),
         })
     }
 
@@ -415,6 +441,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            notification_state: McpServerNotificationState::new(),
         })
     }
 
@@ -431,6 +458,7 @@ impl RmcpClient {
             params.clone(),
             send_elicitation,
             self.elicitation_pause_state.clone(),
+            self.notification_state.clone(),
         );
         let pending_transport = {
             let mut guard = self.state.lock().await;
@@ -500,6 +528,10 @@ impl RmcpClient {
             .await?;
         self.persist_oauth_tokens().await;
         Ok(result)
+    }
+
+    pub fn tool_list_change_generation(&self) -> u64 {
+        self.notification_state.tool_list_change_generation()
     }
 
     #[instrument(level = "trace", skip_all)]

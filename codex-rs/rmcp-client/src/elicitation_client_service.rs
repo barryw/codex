@@ -22,6 +22,7 @@ use crate::logging_client_handler::LoggingClientHandler;
 use crate::rmcp_client::Elicitation;
 use crate::rmcp_client::ElicitationPauseState;
 use crate::rmcp_client::ElicitationResponse;
+use crate::rmcp_client::McpServerNotificationState;
 use crate::rmcp_client::SendElicitation;
 
 const MCP_PROGRESS_TOKEN_META_KEY: &str = "progressToken";
@@ -49,6 +50,7 @@ impl ElicitationClientService {
         client_info: ClientInfo,
         send_elicitation: SendElicitation,
         pause_state: ElicitationPauseState,
+        notification_state: McpServerNotificationState,
     ) -> Self {
         let supports_openai_form = client_info
             .capabilities
@@ -60,6 +62,7 @@ impl ElicitationClientService {
             handler: LoggingClientHandler::new(
                 client_info,
                 clone_send_elicitation(Arc::clone(&send_elicitation)),
+                notification_state,
             ),
             supports_openai_form,
             send_elicitation,
